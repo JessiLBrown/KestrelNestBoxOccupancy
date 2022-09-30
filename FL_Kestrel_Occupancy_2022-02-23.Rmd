@@ -1,0 +1,534 @@
+---
+title: "Florida Kestrel Occupancy Modeling"
+output: html_notebook
+---
+
+This is a fresh run-through of the occupancy modeling for American kestrels nesting in Florida, from 2008-2014. Note that there was no observations conducted during 2011.
+
+Start with loading `runjags` and getting the input data. It needs to be transformed into a 3D array
+
+```{r}
+library(runjags)
+
+getwd()
+
+kesdat <- read.csv(file = "CombinedBimonthOccupancy.csv", header = T, row.names=1)
+kesdat <- as.matrix(kesdat)
+dim(kesdat)
+```
+
+There are 90 sites, 8 visits per year, and 7 years. Then make an initial conditions  matrix. We can also find the naive occupancy by summing across the margins.
+
+```{r}
+y <- array(kesdat, dim = c(90, 8, 7))	# 90 sites, 8 reps, 7 years
+#y <- y[,,-4]	# 90 sites, 8 reps, 6 years
+z.init <- apply(y, c(1, 3), max, na.rm=T)
+z.init[z.init == "-Inf"] <- NA
+raw.occ <- apply(z.init, 2, sum, na.rm=T)
+raw.occ
+```
+
+Now we'll make a few helper functions/vectors, such as a sequential vector for the box checks, and defining the logit function.
+```{r}
+bimonth <- c(1:8)
+# scale to z-standards
+bimonth <- (bimonth-mean(bimonth))/sd(bimonth)
+logit<-function(x){
+log(x/(1-x))
+}
+```
+
+# Occupancy model
+Now we can write our occupancy model in JAGS, and, well, run it.
+
+```{r}
+# letting intercept of p effect vary by years
+sink("DynoccQuadPT.jags")
+cat("
+    model {
+    
+    # Specify priors
+    psi1 ~ dunif(0, 1)
+    beta.p ~ dunif(-10,10)
+    beta2.p ~ dunif(-10,10)
+    
+    for (k in 1:2){
+      phi[k] ~ dunif(0, 1)
+      gamma[k] ~ dunif(0, 1)
+      alpha.p[k] ~ dunif(-3, 3) 
+      }
+    for (k in 5:6){
+      phi[k] ~ dunif(0, 1)
+      gamma[k] ~ dunif(0, 1)
+      alpha.p[(k-1)] ~ dunif(-3, 3) 
+    }
+    alpha.p[3] ~ dunif(-3, 3)
+    alpha.p[6] ~ dunif(-3, 3)
+    
+    phi[3] <- (phi[1]+phi[2]+phi[4]+phi[5]+phi[6])/5
+    gamma[3] <- (gamma[1]+gamma[2]+gamma[4]+gamma[5]+gamma[6])/5
+    p.miss <- 0 
+    
+    phi[4] ~ dunif(0, 1)
+    gamma[4] ~ dunif(0, 1)
+    
+    # Ecological submodel: Define state conditional on parameters
+    for (i in 1:nsite){
+      z[i,1] ~ dbern(psi1)
+      for (k in 2:nyear){
+            muZ[i,k]<- z[i,k-1]*phi[k-1] + (1-z[i,k-1])*gamma[k-1]
+            z[i,k] ~ dbern(muZ[i,k])
+            } #k
+      } #i
+    
+    # Observation model
+    for (i in 1:nsite){
+      for (j in 1:nrep){
+            for (k in 1:3){
+                  muy[i,j,k] <- z[i,k]*p[i,j,k]
+                  y[i,j,k] ~ dbern(muy[i,j,k])
+                  logit(p[i,j,k]) <- alpha.p[k] + beta.p * bimonth[j] + beta2.p * pow(bimonth[j], 2)
+                  } #k
+            muy[i,j,4] <- z[i,4]*p.miss
+            y[i,j,4] ~ dbern(muy[i,j,4])
+            for (k in 5:nyear){
+                  muy[i,j,k] <- z[i,k]*p[i,j,(k-1)]
+                  y[i,j,k] ~ dbern(muy[i,j,k])
+                  logit(p[i,j,(k-1)]) <- alpha.p[(k-1)] + beta.p * bimonth[j] + beta2.p * pow(bimonth[j], 2)
+                  } #k
+            } #j
+      } #i
+    
+    # Derived parameters: Sample and population occupancy, growth rate and turnover
+    psi[1] <- psi1
+    n.occ[1]<-sum(z[1:nsite,1])
+    mean.p[1] <- exp(alpha.p[1])/(1 + exp(alpha.p[1]))
+    log.p[1] <- log(mean.p[1])
+    for (k in 2:nyear){
+      psi[k] <- psi[k-1]*phi[k-1] + (1-psi[k-1])*gamma[k-1]
+      n.occ[k] <- sum(z[1:nsite,k])
+      growthr[k-1] <- psi[k]/psi[k-1]                       
+      turnover[k-1] <- (1 - psi[k-1]) * gamma[k-1]/psi[k]
+      }
+    for (k in 2:(nyear-1)){
+      mean.p[k] <- exp(alpha.p[k])/(1 + exp(alpha.p[k]))
+      log.p[k] <- log(mean.p[k])
+    }
+      overall.p <- exp((1/(nyear-1))*sum(log.p[1:(nyear-1)]))   # Geometric mean
+    }
+    ",fill = TRUE)
+sink()
+
+# Bundle data
+win.data <- list(
+      y = y, 
+      nsite = dim(y)[1], 
+      nrep = dim(y)[2], 
+      nyear = dim(y)[3], 
+      bimonth=bimonth)
+
+# Initial values
+inits <- function(){ list(z = z.init, 
+                          alpha.p = runif(6, -3, 3), 
+                          beta.p = runif(1, -3, 3), 
+                          beta2.p = runif(1, -3, 3))}
+
+n.adapt <- 4000
+n.update <- 1000
+n.samp <- 1000
+n.chains <- 2
+
+set.seed(123)
+outQPT <- run.jags("DynoccQuadPT.jags", data=win.data, inits=inits, n.chains=n.chains, sample=n.samp, method="parallel", monitor=c("psi", "phi", "gamma", "beta.p", "beta2.p", "n.occ", "growthr", "turnover", "mean.p"))
+outQPT
+```
+That does indeed run, seems to be kind of, well, clunky in the priors and such. Let me see if I can re-write it to be less ugly. I think I will make a helper function to determine appropriate beta distribution parameter values for some of the priors.
+
+```{r}
+# a function for beta distribution parameter estimation
+estBetaParams <- function(mu, var){
+  alpha <- ((1 - mu) / var - 1/mu) * mu ^ 2
+  beta <- alpha * (1 / mu -1)
+  return(params = list(alpha = alpha, beta = beta))
+}
+
+estBetaParams(0.95, 0.0225) # for 95 value, 15 SD
+```
+What about a 50% with perhaps 15 variability (for gamma)?
+
+```{r}
+estBetaParams(0.5, 0.0225)
+```
+
+Ok, let's get some of those in there, betas for the phi and gamma parameters, and perhaps some half Cauchy for things like p.
+
+```{r}
+# letting intercept of p effect vary by years
+sink("DynoccQuadPT.jags")
+cat("
+    model {
+    
+    # Specify priors
+    psi1 ~ dunif(0, 1)
+    beta.p ~ dt(0, 1/2.5^2, 1)
+    beta2.p ~ dt(0, 1/2.5^2, 1)
+    
+    for (k in 1:2){
+      phi[k] ~ dunif(0, 1)
+      gamma[k] ~ dunif(0, 1)
+      alpha.p[k] ~ dt(0, 1/2.5^2, 1)
+      }
+    for (k in 4:6){
+      phi[k] ~ dunif(0, 1)
+      gamma[k] ~ dunif(0, 1)
+      alpha.p[k] ~ dt(0, 1/2.5^2, 1)
+    }
+    alpha.p[3] ~ dt(0, 1/2.5^2, 1) 
+
+    phi[3] <- (phi[1]+phi[2]+phi[4]+phi[5]+phi[6])/5
+    gamma[3] <- (gamma[1]+gamma[2]+gamma[4]+gamma[5]+gamma[6])/5
+    p.miss <- 0 
+
+    # Ecological submodel: Define state conditional on parameters
+    for (i in 1:nsite){
+      z[i,1] ~ dbern(psi1)
+      for (k in 2:nyear){
+            muZ[i,k]<- z[i,k-1]*phi[k-1] + (1-z[i,k-1])*gamma[k-1]
+            z[i,k] ~ dbern(muZ[i,k])
+            } #k
+      } #i
+    
+    # Observation model
+    for (i in 1:nsite){
+      for (j in 1:nrep){
+            for (k in 1:3){
+                  muy[i,j,k] <- z[i,k]*p[i,j,k]
+                  y[i,j,k] ~ dbern(muy[i,j,k])
+                  logit(p[i,j,k]) <- alpha.p[k] + beta.p * bimonth[j] + beta2.p * pow(bimonth[j], 2)
+                  } #k
+            muy[i,j,4] <- z[i,4]*p.miss
+            y[i,j,4] ~ dbern(muy[i,j,4])
+            for (k in 5:nyear){
+                  muy[i,j,k] <- z[i,k]*p[i,j,(k-1)]
+                  y[i,j,k] ~ dbern(muy[i,j,k])
+                  logit(p[i,j,(k-1)]) <- alpha.p[(k-1)] + beta.p * bimonth[j] + beta2.p * pow(bimonth[j], 2)
+                  } #k
+            } #j
+      } #i
+    
+    # Derived parameters: Sample and population occupancy, growth rate and turnover
+    psi[1] <- psi1
+    n.occ[1]<-sum(z[1:nsite,1])
+    mean.p[1] <- exp(alpha.p[1])/(1 + exp(alpha.p[1]))
+    log.p[1] <- log(mean.p[1])
+    for (k in 2:nyear){
+      psi[k] <- psi[k-1]*phi[k-1] + (1-psi[k-1])*gamma[k-1]
+      n.occ[k] <- sum(z[1:nsite,k])
+      growthr[k-1] <- psi[k]/psi[k-1]                       
+      turnover[k-1] <- (1 - psi[k-1]) * gamma[k-1]/psi[k]
+      }
+    for (k in 2:(nyear-1)){
+      mean.p[k] <- exp(alpha.p[k])/(1 + exp(alpha.p[k]))
+      log.p[k] <- log(mean.p[k])
+    }
+      overall.p <- exp((1/(nyear-1))*sum(log.p[1:(nyear-1)]))   # Geometric mean
+    }
+    ",fill = TRUE)
+sink()
+
+# Bundle data
+win.data <- list(
+      y = y, 
+      nsite = dim(y)[1], 
+      nrep = dim(y)[2], 
+      nyear = dim(y)[3], 
+      bimonth=bimonth)
+
+# Initial values
+inits <- function(){ list(z = z.init, 
+                          alpha.p = runif(6, -5, 5), 
+                          beta.p = runif(1, -3, 3), 
+                          beta2.p = runif(1, -3, 3))}
+
+n.adapt <- 4000
+n.update <- 1000
+n.samp <- 1000
+n.chains <- 2
+
+set.seed(123)
+outQPT <- run.jags("DynoccQuadPT.jags", data=win.data, inits=inits, n.chains=n.chains, sample=n.samp, method="parallel", monitor=c("psi", "phi", "gamma", "beta.p", "beta2.p", "n.occ", "growthr", "turnover", "mean.p"))
+outQPT
+```
+Can I get a DIC out of this?
+```{r}
+extract.runjags(outQPT, "dic")
+```
+
+Let's pull out some of the output. And then write to disk Then, let's extend the model and get some more statistics/parameters.
+
+```{r}
+library(coda)
+outQPT.coda <- as.mcmc.list(outQPT)
+
+outQPT.out <- summary(outQPT, vars=c("n.occ"))
+n.occ.QPT <- outQPT.out[,2]
+sd.n.occ.QPT <- outQPT.out[,5]
+write.csv(outQPT$BUGSoutput$summary, "OccupancyModelOutput_2022-02-23.csv")
+
+outQPT.p <- extend.jags(outQPT, drop.monitor=c("psi", "phi", "gamma", "beta.p", "beta2.p", "n.occ", "growthr", "turnover", "mean.p"), add.monitor=c("alpha.p", "beta.p", "beta2.p", "mean.p", "overall.p"), sample=2000)
+outQPT.p.coda <- as.mcmc.list(outQPT.p)
+print(outQPT.p, dig = 4) 
+```
+
+Let's figure out how many surveys are needed to detect kestrels, given they are there. This version simply uses the overall mean p - which does not vary by sample date. Hence, it is not as realistic as stepping through using the actual biweekly value.
+
+```{r}
+Pstar <- array(NA, dim = c(2000, 8))
+x <- cbind(rep(1, 2000), rep(2, 2000), rep(3, 2000), rep(4, 2000), rep(5, 2000), rep(6, 2000), rep(7, 2000), rep(8, 2000))
+for (i in 1:2000) {
+	for (j in 1:8){
+		Pstar[i,j] <- 1 - (1 - outQPT.p.coda[[1]][i,15])^j
+		} #j
+	} #i
+{pdf("SurveysWithCumulativeDetectionProbGeneral.pdf", width = 6, height = 4)
+op <- par(mar = c(5,6,4,2) + 0.1)
+  boxplot(Pstar ~ x, col = "gray", las = 1, ylab = "Probability of\nOccupancy Detection", xlab = "Total Number of Surveys", 
+          outline = FALSE, ylim = c(0.5,1))
+  legend("bottomright", legend="A", cex = 2, bty="n")
+abline(h = 0.95, lty = 2, lwd = 2)
+par(op)
+dev.off()}
+
+{op <- par(mar = c(5,6,4,2) + 0.1)
+  boxplot(Pstar ~ x, col = "gray", las = 1, ylab = "Probability of\nOccupancy Detection", xlab = "Total Number of Surveys", 
+          outline = FALSE, ylim = c(0.5,1))
+  legend("bottomright", legend="A", cex = 2, bty="n")
+abline(h = 0.95, lty = 2, lwd = 2)
+par(op)}
+```
+
+# Now let's investigate survey timing effects. 
+This is based on the intercept for p in the year 2 of the study, which is a low year for detection probs.
+
+```{r}
+mcmc.sample <- outQPT.p$BUGSoutput$n.sims
+
+date.pred <- bimonth
+p.pred.date <- plogis(summary(outQPT.p.coda)$statistics[2,1] + summary(outQPT.p.coda)$statistics[7,1] * date.pred + summary(outQPT.p.coda)$statistics[8,1] * date.pred^2)
+
+array.p.pred.date <- array(NA, dim = c(length(date.pred), 2000))
+for (i in 1:2000){
+   array.p.pred.date[,i] <- plogis(outQPT.p.coda[[1]][i,2] + outQPT.p.coda[[1]][i,7] * date.pred + outQPT.p.coda[[1]][i,8] * date.pred^2)
+   }
+
+```
+
+
+## Plot for a subsample of MCMC draws
+
+We want to update the x axis to have text in it, instead of those numbers. This is a base R plot so I need to figure this out...
+
+## Suppress the axis
+plot(x, y, xaxt="n", yaxt="n")
+## Changing x axis
+xtick<-seq(0, 10, by=5)
+axis(side=1, at=xtick, labels = FALSE)
+text(x=xtick,  par("usr")[3], 
+     labels = xtick, srt = 45, pos = 1, xpd = TRUE)
+
+```{r}
+sub.set <- sort(sample(1:2000, size = 200))
+
+{pdf("DetectionProbabilityAcrossYear_2022-07-15.pdf")
+  plot(c(1:8), p.pred.date, main = "", ylab = "Detection Probability", xlab = "Survey Timing", ylim = c(0, 1), type = "l", lwd = 3, frame.plot = FALSE, xaxt = "n")
+  axis(side = 1, at = c(1:8), labels=c("1 Mar", "15 Mar", "1 Apr", "15 Apr", "1 May", "15 May","1 Jun","15 Jun"))
+for (i in sub.set){
+   lines(c(1:8), array.p.pred.date[,i], type = "l", lwd = 1, col = "gray")
+   }
+lines(c(1:8), p.pred.date, type = "l", lwd = 3, col = "black")
+dev.off()}
+
+{plot(c(1:8), p.pred.date, main = "", ylab = "Detection Probability", xlab = "Survey Timing", ylim = c(0, 1), type = "l", lwd = 3, frame.plot = FALSE, xaxt = "n")
+  axis(side = 1, at = c(1:8), labels=c("1 Mar", "15 Mar", "1 Apr", "15 Apr", "1 May", "15 May","1 Jun","15 Jun"))
+for (i in sub.set){
+   lines(c(1:8), array.p.pred.date[,i], type = "l", lwd = 1, col = "gray")
+   }
+lines(c(1:8), p.pred.date, type = "l", lwd = 3, col = "black")}
+```
+
+## Figuring out how prod and cumprod work
+
+```{r}
+1-((1-p.pred.date[1])*(1-p.pred.date[2])*(1-p.pred.date[3])*(1-p.pred.date[4])*(1-p.pred.date[5])*(1-p.pred.date[6])*(1-p.pred.date[7])*(1-p.pred.date[8]))
+```
+
+
+```{r}
+1-prod(1-p.pred.date)
+```
+
+
+```{r}
+1-cumprod(1-p.pred.date) # for all 8 sequentially
+```
+
+
+```{r}
+1-cumprod(1-p.pred.date[2:8]) # starting at 2nd week
+```
+
+
+```{r}
+1-cumprod(1-p.pred.date[3:8])
+```
+
+
+```{r}
+1-cumprod(1-p.pred.date[4:8])
+```
+
+
+```{r}
+1-cumprod(1-p.pred.date[5:8])
+```
+
+
+```{r}
+1-cumprod(1-p.pred.date[6:8])
+```
+
+```{r}
+1-cumprod(1-p.pred.date[7:8])
+```
+
+OK, let's redo using the cumprod function and the full array, which has all the uncertainty propagated through. You'll note that the second check ends up very close to 0.95, so a third would be better than not doing.
+
+```{r}
+Pstar <- array(NA, dim = c(2000, 8))
+x <- cbind(rep(1, 2000), rep(2, 2000), rep(3, 2000), rep(4, 2000), rep(5, 2000), rep(6, 2000), rep(7, 2000), rep(8, 2000))
+
+for (i in 1:2000) {
+      Pstar[i,] <- 1-cumprod(1-array.p.pred.date[,i])
+} #i
+
+{pdf("SurveysWithCumulativeDetectionProbYear2.pdf", width = 6, height = 4)
+  op <- par(mar = c(5,6,4,2) + 0.1)
+  boxplot(Pstar ~ x, col = "gray", las = 1, ylab = "Probability of\nOccupancy Detection", xlab = "Total Number of Surveys", outline = FALSE, ylim = c(0.5,1))
+  legend("bottomright", legend="B", cex = 2, bty="n")
+abline(h = 0.95, lty = 2, lwd = 2)
+par(op)
+dev.off()}
+
+{op <- par(mar = c(5,6,4,2) + 0.1)
+  boxplot(Pstar ~ x, col = "gray", las = 1, ylab = "Probability of\nOccupancy Detection", xlab = "Total Number of Surveys", outline = FALSE)
+abline(h = 0.95, lty = 2, lwd = 2, ylim = c(0.5,1))
+legend("bottomright", legend="B", cex = 2, bty="n")
+par(op)}
+```
+Let's try a different method yet.
+
+```{r}
+Pstar <- data.frame(V1=rep(NA,2000*6), V2=rep(NA,2000*6), V3=rep(NA,2000*6), V4=rep(NA,2000*6), V5=rep(NA,2000*6), V6=rep(NA,2000*6), V7=rep(NA,2000*6), V8=rep(NA,2000*6), NumSurveys=c(rep(8,2000),rep(7,2000),rep(6,2000),rep(5,2000),rep(3,2000),rep(2,2000)))
+
+for (i in 1:2000) {
+      Pstar[i,1:8] <- 1-cumprod(1-array.p.pred.date[1:8,i])
+} #i
+for (i in 2001:4000) {
+      Pstar[i,2:8] <- 1-cumprod(1-array.p.pred.date[2:8,i-2000])
+} #i
+for (i in 4001:6000) {
+      Pstar[i,3:8] <- 1-cumprod(1-array.p.pred.date[3:8,i-4000])
+} #i
+for (i in 6001:8000) {
+      Pstar[i,4:8] <- 1-cumprod(1-array.p.pred.date[4:8,i-6000])
+} #i
+for (i in 8001:10000) {
+      Pstar[i,c(2,4,6)] <- 1-cumprod(1-array.p.pred.date[c(2,4,6),i-8000])
+} #i
+for (i in 10001:12000) {
+      Pstar[i,c(3,5)] <- 1-cumprod(1-array.p.pred.date[c(3,5),i-10000])
+} #i
+Pstar$NumSurveys <- factor(Pstar$NumSurveys, levels=c("8","7","6","5","3","2"))
+
+library(reshape2)
+Pstar.melt <- melt(Pstar, id.vars="NumSurveys")
+library(ggplot2)
+p <- ggplot(Pstar.melt, aes(factor(variable), value)) 
+p + geom_boxplot() + 
+  facet_wrap(~NumSurveys) + 
+  labs(x="Survey Timing", y="Cumulative Detection Probability") + 
+  geom_hline(yintercept = 0.95, linetype="dotdash") + 
+  scale_x_discrete(labels=c("1 Mar", "15 Mar", "1 Apr", "15 Apr", "1 May","15 May","1 Jun","15 Jun")) +
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=40, margin = margin(t = 10, r = 0, b = 0, l = 0))) 
+
+ggsave("SixScenarios.pdf")
+```
+## Requested by Karl to do a version with 8 surveys, 6 surveys, then 1 Apr, 1 May, 1 Jun (3,5,7)
+
+```{r}
+Pstar <- data.frame(V1=rep(NA,2000*3), V2=rep(NA,2000*3), V3=rep(NA,2000*3), V4=rep(NA,2000*3), V5=rep(NA,2000*3), V6=rep(NA,2000*3), V7=rep(NA,2000*3), V8=rep(NA,2000*3), NumSurveys=c(rep(8,2000),rep(6,2000),rep(3,2000)))
+
+for (i in 1:2000) {
+      Pstar[i,1:8] <- 1-cumprod(1-array.p.pred.date[1:8,i])
+} #i
+for (i in 2001:4000) {
+      Pstar[i,3:8] <- 1-cumprod(1-array.p.pred.date[3:8,i-2000])
+} #i
+for (i in 4001:6000) {
+      Pstar[i,c(3,5,7)] <- 1-cumprod(1-array.p.pred.date[c(3,5,7),i-4000])
+} #i
+Pstar$NumSurveys <- factor(Pstar$NumSurveys, levels=c("8","6","3"))
+
+Pstar.melt <- melt(Pstar, id.vars="NumSurveys")
+
+p <- ggplot(Pstar.melt, aes(factor(variable), value)) 
+p + geom_boxplot() + 
+  facet_wrap(~NumSurveys, ncol=1) + 
+  labs(x="Survey timing", y="Cumulative detection probability") + 
+  geom_hline(yintercept = 0.95, linetype="dotdash") + 
+  scale_x_discrete(labels=c("1 Mar", "15 Mar", "1 Apr", "15 Apr", "1 May","15 May","1 Jun","15 Jun")) + 
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=40, margin = margin(t = 10, r = 0, b = 0, l = 0))) 
+```
+
+
+```{r}
+p + geom_boxplot() + 
+  facet_wrap(~NumSurveys, nrow=1) + 
+  labs(x="Survey Timing", y="Cumulative Detection Probability") + 
+  geom_hline(yintercept = 0.95, linetype="dotdash") + 
+  scale_x_discrete(labels=c("1 Mar", "15 Mar", "1 Apr", "15 Apr", "1 May","15 May","1 Jun","15 Jun")) +   
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=40, margin = margin(t = 10, r = 0, b = 0, l = 0))) 
+ggsave("SurveyScenario.pdf")
+p + geom_boxplot() + 
+  facet_wrap(~NumSurveys, nrow=1) + 
+  labs(x="Survey Timing", y="Cumulative Detection Probability") + 
+  geom_hline(yintercept = 0.95, linetype="dotdash") + 
+  scale_x_discrete(labels=c("1 Mar", "15 Mar", "1 Apr", "15 Apr", "1 May","15 May","1 Jun","15 Jun")) +   
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=40, margin = margin(t = 10, r = 0, b = 0, l = 0))) 
+```
+# Plot the estimated occupancy versus raw counts
+
+```{r}
+raw.occ[4] <- NA
+{pdf("RawEstimatedOccupancy.pdf", width = 7, height = 5)
+  op <- par(mar = c(5,6,4,2) + 0.1)
+  plot(2008:2014, raw.occ, type="p", xlab="Year", ylab="Number of Occupied Nest Box Sites", col="black", ylim=c(55,88), pch=17, cex=1.5, cex.lab=1.5)
+points(2008:2014, n.occ.QPT, col="gray", cex = 1.5)
+segments(2008:2014, outQPT.out[,1], 2008:2014, outQPT.out[,3], col="gray")
+legend(x="bottomleft", legend=c("Observed", "Estimated"), bty="n", pch=c(17,1), col=c("black","gray"))
+par(op)
+dev.off()}
+
+{op <- par(mar = c(5,6,4,2) + 0.1)
+  plot(2008:2014, raw.occ, type="p", xlab="Year", ylab="Number of Occupied Nest Box Sites", col="black", ylim=c(55,88), pch=17, cex=1.5, cex.lab=1.5)
+points(2008:2014, n.occ.QPT, col="gray", cex = 1.5)
+segments(2008:2014, outQPT.out[,1], 2008:2014, outQPT.out[,3], col="gray")
+legend(x="bottomleft", legend=c("Observed", "Estimated"), bty="n", pch=c(17,1), col=c("black","gray"))
+par(op)}
+```
+
+
